@@ -82,6 +82,16 @@ raw_supplies, raw_demands): 已保存可行方案的供水容量校核(只读计
 总送达量等于需求总量才判容量充足, 仅连通但容量不足时返回不足;
 无必保点时返回充足及零需求。
 
+以及 plan_capacity_expansion(snapshot, closed_valves, raw_capacities,
+raw_supplies, raw_demands, raw_candidates): 已保存可行方案的管段扩容
+预览(只读计算)。沿用供水容量校核的全部录入(方案快照 + 未关阀管段流量
+上限 + 进水点供给上限 + 必保点需求), 另录至多 6 个扩容候选: 每个候选
+为一条不同的未关阀管段、正整数扩容增量与正整数一次性费用, 每项最多选
+一次; 选中后该管段净流量绝对值的上限变为原上限 + 增量。枚举全部候选
+组合(<=2^6=64), 用整数最大流检验全部必保点需求, 选出一次性费用合计
+最低的组合, 同费按管段编号升序列表字典序决胜; 原容量已足够时返回零
+费用空清单; 全部候选仍不足时返回全选后的最大送达量与总缺口。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
 BFS 连通性检查即可, 简单且确定。
 """
@@ -96,6 +106,7 @@ MAX_CANDIDATES = 6
 MAX_MONITOR_CANDIDATES = 12
 MAX_WATER_VEHICLES = 6
 MAX_SPARE_PACKAGES = 12
+MAX_EXPANSION_CANDIDATES = 6
 
 
 class NetworkValidationError(ValueError):
@@ -2385,25 +2396,16 @@ def plan_spare_parts(snapshot: dict[str, Any],
 # 供水容量校核(只读计算, 针对已保存的可行方案)
 # ---------------------------------------------------------------------------
 
-def plan_capacity_check(snapshot: dict[str, Any],
-                        closed_valves: list[str],
-                        raw_capacities: Any,
-                        raw_supplies: Any,
-                        raw_demands: Any) -> dict[str, Any]:
-    """已保存可行方案的供水容量校核(只读计算, 不改方案与管网)。
+def _capacity_base(snapshot: dict[str, Any],
+                   closed_valves: list[str],
+                   raw_capacities: Any,
+                   raw_supplies: Any,
+                   raw_demands: Any) -> dict[str, Any]:
+    """供水容量校核 / 管段扩容预览共用的录入校验与输水网数据(只读)。
 
-    以方案快照中**未关阀管段**(计划阀门未关闭的管段)构成无向输水网:
-    每条管段录入正整数流量上限(管段净流量的绝对值受同一个上限约束,
-    即无向边容量, 用两条容量相同的反向有向弧建模, 最大流值与无向容量
-    一致), 每个进水点录入正整数供给上限, 每个必保供水点录入正整数需求。
-    三类录入的编号集合都必须与方案快照**完整对应**(未关阀管段 / 进水点 /
-    必保点, 不多不少)。用整数最大流(Dinic)求可送达必保点的最大总量:
-    源->进水点容量=供给上限, 管段=无向容量边, 必保点->汇容量=需求。
-    各必保点实际送达量按必保点编号升序逐个锁定: 前序点送达量锁定后,
-    本点在残余网络上尽可能多送(二分 + 最大流校验), 结果唯一。返回需求
-    总量、最大送达量、总缺口与各必保点实际送达量; 总送达量等于需求总量
-    才判容量充足, 仅连通但容量不足时返回不足; 无必保点时返回充足及
-    零需求。
+    校验方案快照、计划关闭阀门(必须存在于快照管网), 以及三类与快照完整
+    对应的正整数录入: 未关阀管段流量上限、进水点供给上限、必保点需求。
+    返回构造输水网与结果所需的全部数据。
     """
     try:
         nodes, segments, valves = validate_network(snapshot)
@@ -2504,6 +2506,120 @@ def plan_capacity_check(snapshot: dict[str, Any],
     if errors:
         raise NetworkValidationError(errors)
 
+    return {
+        "nodes": nodes,
+        "label_of": label_of,
+        "closed": closed,
+        "open_segments": open_segments,
+        "open_seg_ids": open_seg_ids,
+        "capacities": capacities,
+        "inlet_ids": inlet_ids,
+        "supplies": supplies,
+        "keep_ids": keep_ids,
+        "demands": demands,
+    }
+
+
+def _capacity_flow(nodes: list[dict[str, Any]],
+                   open_segments: list[dict[str, Any]],
+                   inlet_ids: list[str],
+                   keep_ids: list[str]):
+    """构造整数最大流输水网, 返回 (build_caps, flow_of)。
+
+    build_caps(capacities, supplies, need): 源->进水点容量=供给上限,
+    管段=无向容量边(两条容量相同的反向有向弧, 净流量绝对值不超过同一
+    上限), 必保点->汇容量=need; flow_of 为其最大送达量(Dinic)。
+    """
+    n = len(nodes)
+    idx = {nd["id"]: i + 1 for i, nd in enumerate(nodes)}
+    sink = n + 1
+    size = n + 2
+
+    def build_caps(capacities: dict[str, int],
+                   supplies: dict[str, int],
+                   need: dict[str, int]) -> list[list[int]]:
+        caps = [[0] * size for _ in range(size)]
+        for iid in inlet_ids:
+            caps[0][idx[iid]] = supplies[iid]
+        for sg in open_segments:
+            c = capacities[sg["id"]]
+            u, v = idx[sg["endpoint_a"]], idx[sg["endpoint_b"]]
+            caps[u][v] += c
+            caps[v][u] += c
+        for kid in keep_ids:
+            caps[idx[kid]][sink] = need[kid]
+        return caps
+
+    def flow_of(capacities: dict[str, int],
+                supplies: dict[str, int],
+                need: dict[str, int]) -> int:
+        return _dinic_maxflow(build_caps(capacities, supplies, need), 0, sink)
+
+    return build_caps, flow_of
+
+
+def _keep_delivery_targets(flow_with_need, keep_ids: list[str],
+                           demands: dict[str, int],
+                           delivered_total: int) -> dict[str, int]:
+    """各必保点实际送达量: 编号升序逐个锁定, 前序点锁定后本点尽可能多送。
+
+    flow_with_need(need) 返回各点汇边容量为 need 时的最大送达量; 总量
+    充足时各点送达量即为其需求, 不足时本点在残余网络上尽可能多送(测试
+    本点上界时把后续点的汇边容量置 0, 前序+本点目标全部可完成当且仅当
+    最大流恰好等于其和), 结果唯一。
+    """
+    total_demand = sum(demands[kid] for kid in keep_ids)
+    if delivered_total >= total_demand:
+        return {kid: demands[kid] for kid in keep_ids}
+    targets: dict[str, int] = {}
+    for kid in keep_ids:
+        lo, hi = 0, demands[kid]
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            need = {k2: 0 for k2 in keep_ids}
+            need.update(targets)
+            need[kid] = mid
+            locked_sum = sum(targets.values()) + mid
+            if flow_with_need(need) == locked_sum:
+                lo = mid
+            else:
+                hi = mid - 1
+        targets[kid] = lo
+    return targets
+
+
+def plan_capacity_check(snapshot: dict[str, Any],
+                        closed_valves: list[str],
+                        raw_capacities: Any,
+                        raw_supplies: Any,
+                        raw_demands: Any) -> dict[str, Any]:
+    """已保存可行方案的供水容量校核(只读计算, 不改方案与管网)。
+
+    以方案快照中**未关阀管段**(计划阀门未关闭的管段)构成无向输水网:
+    每条管段录入正整数流量上限(管段净流量的绝对值受同一个上限约束,
+    即无向边容量, 用两条容量相同的反向有向弧建模, 最大流值与无向容量
+    一致), 每个进水点录入正整数供给上限, 每个必保供水点录入正整数需求。
+    三类录入的编号集合都必须与方案快照**完整对应**(未关阀管段 / 进水点 /
+    必保点, 不多不少)。用整数最大流(Dinic)求可送达必保点的最大总量:
+    源->进水点容量=供给上限, 管段=无向容量边, 必保点->汇容量=需求。
+    各必保点实际送达量按必保点编号升序逐个锁定: 前序点送达量锁定后,
+    本点在残余网络上尽可能多送(二分 + 最大流校验), 结果唯一。返回需求
+    总量、最大送达量、总缺口与各必保点实际送达量; 总送达量等于需求总量
+    才判容量充足, 仅连通但容量不足时返回不足; 无必保点时返回充足及
+    零需求。
+    """
+    base = _capacity_base(snapshot, closed_valves, raw_capacities,
+                          raw_supplies, raw_demands)
+    closed = base["closed"]
+    open_segments = base["open_segments"]
+    open_seg_ids = base["open_seg_ids"]
+    capacities = base["capacities"]
+    inlet_ids = base["inlet_ids"]
+    supplies = base["supplies"]
+    keep_ids = base["keep_ids"]
+    demands = base["demands"]
+    label_of = base["label_of"]
+
     open_segment_rows = [{
         "id": sg["id"], "endpoint_a": sg["endpoint_a"],
         "endpoint_b": sg["endpoint_b"], "capacity": capacities[sg["id"]],
@@ -2535,47 +2651,17 @@ def plan_capacity_check(snapshot: dict[str, Any],
 
     # ---- 整数最大流: 源->进水点(供给上限), 管段=无向容量边(两条反向弧,
     #      净流量绝对值不超过同一上限), 必保点->汇(需求) ----
-    n = len(nodes)
-    idx = {nd["id"]: i + 1 for i, nd in enumerate(nodes)}
-    sink = n + 1
-    size = n + 2
-
-    def build_caps(need: dict[str, int]) -> list[list[int]]:
-        caps = [[0] * size for _ in range(size)]
-        for iid in inlet_ids:
-            caps[0][idx[iid]] = supplies[iid]
-        for sg in open_segments:
-            c = capacities[sg["id"]]
-            u, v = idx[sg["endpoint_a"]], idx[sg["endpoint_b"]]
-            caps[u][v] += c
-            caps[v][u] += c
-        for kid in keep_ids:
-            caps[idx[kid]][sink] = need[kid]
-        return caps
-
+    build_caps, flow_of = _capacity_flow(base["nodes"], open_segments,
+                                         inlet_ids, keep_ids)
     total_demand = sum(demands[kid] for kid in keep_ids)
-    delivered_total = _dinic_maxflow(build_caps(demands), 0, sink)
+    delivered_total = flow_of(capacities, supplies, demands)
 
     # ---- 各必保点实际送达量: 编号升序逐个锁定, 前序点锁定后本点尽可能
     #      多送(测试本点上界时把后续点的汇边容量置 0, 前序+本点目标全部
     #      可完成当且仅当最大流恰好等于其和), 结果唯一 ----
-    if delivered_total >= total_demand:
-        targets = {kid: demands[kid] for kid in keep_ids}
-    else:
-        targets = {}
-        for kid in keep_ids:
-            lo, hi = 0, demands[kid]
-            while lo < hi:
-                mid = (lo + hi + 1) // 2
-                need = {k2: 0 for k2 in keep_ids}
-                need.update(targets)
-                need[kid] = mid
-                locked_sum = sum(targets.values()) + mid
-                if _dinic_maxflow(build_caps(need), 0, sink) == locked_sum:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            targets[kid] = lo
+    targets = _keep_delivery_targets(
+        lambda need: flow_of(capacities, supplies, need),
+        keep_ids, demands, delivered_total)
 
     shortage_total = total_demand - delivered_total
     sufficient = shortage_total == 0
@@ -2614,6 +2700,273 @@ def plan_capacity_check(snapshot: dict[str, Any],
         "demands": demands,
         "node_summary": node_summary,
         "total_demand": total_demand,
+        "delivered_total": delivered_total,
+        "shortage_total": shortage_total,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 管段扩容预览(只读计算, 针对已保存的可行方案)
+# ---------------------------------------------------------------------------
+
+def plan_capacity_expansion(snapshot: dict[str, Any],
+                            closed_valves: list[str],
+                            raw_capacities: Any,
+                            raw_supplies: Any,
+                            raw_demands: Any,
+                            raw_candidates: Any) -> dict[str, Any]:
+    """已保存可行方案的管段扩容预览(只读计算, 不改方案与管网)。
+
+    沿用供水容量校核的全部录入(方案快照 + 未关阀管段流量上限 + 进水点
+    供给上限 + 必保点需求, 编号须与快照完整对应、值为正整数), 另录至多
+    MAX_EXPANSION_CANDIDATES 个扩容候选: 每个候选为一条**不同的未关阀
+    管段**、正整数**扩容增量**与正整数**一次性费用**, 每项最多选一次;
+    选中后该管段净流量绝对值的上限变为 原上限 + 增量。枚举全部候选组合
+    (<=2^6=64), 用整数最大流检验全部必保点需求, 依次按:
+      1) 一次性费用合计最低;
+      2) 管段编号升序列表字典序最小
+    选取组合。原容量已足够时返回零费用空清单; 全部候选仍不足时返回全选
+    后的最大送达量与总缺口(不产生扩容方案, 费用为 null)。
+    """
+    base = _capacity_base(snapshot, closed_valves, raw_capacities,
+                          raw_supplies, raw_demands)
+    closed = base["closed"]
+    open_segments = base["open_segments"]
+    open_seg_ids = base["open_seg_ids"]
+    capacities = base["capacities"]
+    inlet_ids = base["inlet_ids"]
+    supplies = base["supplies"]
+    keep_ids = base["keep_ids"]
+    demands = base["demands"]
+    label_of = base["label_of"]
+
+    # ---- 扩容候选录入校验: 至多 6 个 / 不同的未关阀管段 / 正整数增量与费用 ----
+    if raw_candidates is None:
+        raw_candidates = []
+    if not isinstance(raw_candidates, list):
+        raise NetworkValidationError(["candidates 必须是数组"])
+    errors: list[str] = []
+    if len(raw_candidates) > MAX_EXPANSION_CANDIDATES:
+        errors.append(f"扩容候选数量为 {len(raw_candidates)}, "
+                      f"超过上限 {MAX_EXPANSION_CANDIDATES} 个")
+    open_seg_set = set(open_seg_ids)
+    seg_by_id = {sg["id"]: sg for sg in open_segments}
+    cands: list[dict[str, Any]] = []
+    seen_segs: set[str] = set()
+    for i, cd in enumerate(raw_candidates):
+        if not isinstance(cd, dict):
+            errors.append(f"扩容候选 #{i + 1}: 必须是对象")
+            continue
+        sid = _norm_id(cd.get("segment_id"))
+        label = sid or f"#{i + 1}"
+        if not sid:
+            errors.append(f"扩容候选 #{i + 1}: 缺少管段编号")
+        elif sid in seen_segs:
+            errors.append(f"扩容候选管段重复: {sid}")
+        elif sid not in open_seg_set:
+            errors.append(f"扩容候选管段 {sid} 不是方案快照中的未关阀管段")
+        seen_segs.add(sid)
+        inc = _positive_int(cd.get("increment"))
+        if inc is None:
+            errors.append(f"管段 {label} 的扩容增量必须是正整数, "
+                          f"收到: {cd.get('increment')!r}")
+        cost = _positive_int(cd.get("cost"))
+        if cost is None:
+            errors.append(f"管段 {label} 的一次性费用必须是正整数, "
+                          f"收到: {cd.get('cost')!r}")
+        cands.append({"segment_id": sid, "increment": inc, "cost": cost})
+    if errors:
+        raise NetworkValidationError(errors)
+
+    m = len(cands)
+    open_segment_rows = [{
+        "id": sg["id"], "endpoint_a": sg["endpoint_a"],
+        "endpoint_b": sg["endpoint_b"], "capacity": capacities[sg["id"]],
+    } for sg in open_segments]
+    inlet_rows = [{"id": iid, "label": label_of[iid], "supply": supplies[iid]}
+                  for iid in inlet_ids]
+    candidate_rows = [{
+        "segment_id": c["segment_id"],
+        "endpoint_a": seg_by_id[c["segment_id"]]["endpoint_a"],
+        "endpoint_b": seg_by_id[c["segment_id"]]["endpoint_b"],
+        "base_capacity": capacities[c["segment_id"]],
+        "increment": c["increment"],
+        "cost": c["cost"],
+    } for c in cands]
+
+    # ---- 无必保点: 需求总量为 0, 原容量已足够, 零费用空清单 ----
+    if not keep_ids:
+        return {
+            "ok": True,
+            "sufficient": True,
+            "already_sufficient": True,
+            "empty": True,
+            "closed_valves": closed,
+            "open_segments": open_segment_rows,
+            "open_segment_ids": open_seg_ids,
+            "capacities": capacities,
+            "inlets": inlet_rows,
+            "supplies": supplies,
+            "keep_nodes": [],
+            "demands": {},
+            "candidates": candidate_rows,
+            "candidate_count": m,
+            "combination_count": 1,
+            "feasible_combination_count": 1,
+            "selected_expansions": [],
+            "selected_segment_ids": [],
+            "expanded_capacities": capacities,
+            "total_cost": 0,
+            "node_summary": [],
+            "total_demand": 0,
+            "base_delivered_total": 0,
+            "delivered_total": 0,
+            "shortage_total": 0,
+            "message": ("管段扩容预览(只读, 不修改管网与历史方案): 方案快照"
+                        "中没有必保供水点, 需求总量为 0, 原容量已足够, "
+                        "返回零费用空清单。"),
+        }
+
+    # ---- 枚举全部候选组合: 扩容后上限 = 原上限 + 增量, 整数最大流检验需求 ----
+    build_caps, flow_of = _capacity_flow(base["nodes"], open_segments,
+                                         inlet_ids, keep_ids)
+    total_demand = sum(demands[kid] for kid in keep_ids)
+
+    def expanded_caps(bits: int) -> dict[str, int]:
+        caps = dict(capacities)
+        for j in range(m):
+            if (bits >> j) & 1:
+                cj = cands[j]
+                caps[cj["segment_id"]] += cj["increment"]
+        return caps
+
+    flow_of_bits: list[int] = [0] * (1 << m)
+    best_cost: int | None = None
+    best_ids: tuple[str, ...] = ()
+    best_bits = 0
+    feasible_combinations = 0
+    for bits in range(1 << m):
+        caps = expanded_caps(bits)
+        delivered = flow_of(caps, supplies, demands)
+        flow_of_bits[bits] = delivered
+        if delivered < total_demand:
+            continue
+        feasible_combinations += 1
+        cost = sum(cands[j]["cost"] for j in range(m) if (bits >> j) & 1)
+        ids = tuple(sorted(cands[j]["segment_id"]
+                           for j in range(m) if (bits >> j) & 1))
+        if (best_cost is None or cost < best_cost
+                or (cost == best_cost and ids < best_ids)):
+            best_cost, best_ids, best_bits = cost, ids, bits
+
+    def selected_rows(bits: int) -> list[dict[str, Any]]:
+        rows = [{
+            "segment_id": cands[j]["segment_id"],
+            "endpoint_a": seg_by_id[cands[j]["segment_id"]]["endpoint_a"],
+            "endpoint_b": seg_by_id[cands[j]["segment_id"]]["endpoint_b"],
+            "base_capacity": capacities[cands[j]["segment_id"]],
+            "increment": cands[j]["increment"],
+            "expanded_capacity": (capacities[cands[j]["segment_id"]]
+                                  + cands[j]["increment"]),
+            "cost": cands[j]["cost"],
+        } for j in range(m) if (bits >> j) & 1]
+        rows.sort(key=lambda r: r["segment_id"])
+        return rows
+
+    base_delivered = flow_of_bits[0]
+    keep_nodes = [{"id": kid, "label": label_of[kid], "demand": demands[kid]}
+                  for kid in keep_ids]
+    common = {
+        "closed_valves": closed,
+        "open_segments": open_segment_rows,
+        "open_segment_ids": open_seg_ids,
+        "capacities": capacities,
+        "inlets": inlet_rows,
+        "supplies": supplies,
+        "keep_nodes": keep_nodes,
+        "demands": demands,
+        "candidates": candidate_rows,
+        "candidate_count": m,
+        "combination_count": 1 << m,
+        "feasible_combination_count": feasible_combinations,
+        "total_demand": total_demand,
+        "base_delivered_total": base_delivered,
+    }
+
+    # ---- 存在可满足全部需求的组合: 最低费用组合(原容量足够时为空清单) ----
+    if feasible_combinations:
+        selected = selected_rows(best_bits)
+        selected_ids = [r["segment_id"] for r in selected]
+        already = best_bits == 0
+        node_summary = [{
+            "node_id": kid, "label": label_of[kid],
+            "demand": demands[kid], "delivered": demands[kid], "shortage": 0,
+        } for kid in keep_ids]
+        if already:
+            message = (
+                f"管段扩容预览(只读, 不修改管网与历史方案): 原容量已足够"
+                f"(最大送达量 {base_delivered} 等于需求总量 {total_demand}), "
+                f"无需扩容, 返回零费用空清单(一次性费用合计 0)。")
+        else:
+            message = (
+                f"管段扩容预览(只读, 不修改管网与历史方案): 原容量不足"
+                f"(最大送达量 {base_delivered}, 总缺口 "
+                f"{total_demand - base_delivered}); 选中 {len(selected)} 条"
+                f"管段扩容({', '.join(selected_ids)}), 一次性费用合计 "
+                f"{best_cost}, 扩容后全部 {len(keep_ids)} 个必保点需求"
+                f"(共 {total_demand})均可满足。")
+        return {
+            "ok": True,
+            "sufficient": True,
+            "already_sufficient": already,
+            "empty": False,
+            **common,
+            "selected_expansions": selected,
+            "selected_segment_ids": selected_ids,
+            "expanded_capacities": expanded_caps(best_bits),
+            "total_cost": best_cost,
+            "node_summary": node_summary,
+            "delivered_total": total_demand,
+            "shortage_total": 0,
+            "message": message,
+        }
+
+    # ---- 全部候选仍不足: 全选后的最大送达量与总缺口(不产生扩容方案) ----
+    all_bits = (1 << m) - 1
+    caps_all = expanded_caps(all_bits)
+    delivered_total = flow_of_bits[all_bits]
+    shortage_total = total_demand - delivered_total
+    targets = _keep_delivery_targets(
+        lambda need: flow_of(caps_all, supplies, need),
+        keep_ids, demands, delivered_total)
+    node_summary = [{
+        "node_id": kid, "label": label_of[kid],
+        "demand": demands[kid], "delivered": targets[kid],
+        "shortage": demands[kid] - targets[kid],
+    } for kid in keep_ids]
+    all_selected = selected_rows(all_bits)
+    all_cost = sum(c["cost"] for c in cands)
+    message = (
+        f"管段扩容预览(只读, 不修改管网与历史方案): 全部 {m} 个扩容候选"
+        f"全选后最大送达量仅 {delivered_total}, 仍低于需求总量 "
+        f"{total_demand}, 总缺口 {shortage_total}; 已列出全选后的扩容上限"
+        f"与各必保点缺口, 不产生扩容方案。")
+    return {
+        "ok": False,
+        "reason_code": "INSUFFICIENT_CAPACITY",
+        "sufficient": False,
+        "already_sufficient": False,
+        "empty": False,
+        **common,
+        "selected_expansions": [],
+        "selected_segment_ids": [],
+        "total_cost": None,
+        "all_selected_expansions": all_selected,
+        "all_selected_segment_ids": [r["segment_id"] for r in all_selected],
+        "all_selected_cost_total": all_cost,
+        "expanded_capacities": caps_all,
+        "node_summary": node_summary,
         "delivered_total": delivered_total,
         "shortage_total": shortage_total,
         "message": message,

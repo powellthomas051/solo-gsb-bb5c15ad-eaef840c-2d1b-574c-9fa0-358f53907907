@@ -17,6 +17,8 @@ API:
   POST /api/plans/{id}/spare-parts  可行方案的关阀作业备件包采购预览(只读计算)
   POST /api/plans/{id}/capacity-check
                                     可行方案的供水容量校核(只读计算)
+  POST /api/plans/{id}/capacity-expansion
+                                    可行方案的管段扩容预览(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -35,9 +37,9 @@ from pydantic import BaseModel, Field, field_validator
 import database
 from demo import DEMO_NETWORK
 from solver import (MAX_VALVES, NetworkValidationError, plan_capacity_check,
-                    plan_jumpers, plan_monitors, plan_sequence,
-                    plan_spare_parts, plan_water_delivery, solve,
-                    solve_failover, solve_siting, solve_tradeoff)
+                    plan_capacity_expansion, plan_jumpers, plan_monitors,
+                    plan_sequence, plan_spare_parts, plan_water_delivery,
+                    solve, solve_failover, solve_siting, solve_tradeoff)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -196,6 +198,31 @@ class CapacityCheckIn(BaseModel):
     capacities: dict[str, Any] = Field(default_factory=dict)
     supplies: dict[str, Any] = Field(default_factory=dict)
     demands: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExpansionCandidateIn(BaseModel):
+    """管段扩容候选录入。
+
+    各字段(方案快照中未关阀管段/正整数扩容增量/正整数一次性费用)在
+    solver.plan_capacity_expansion 中逐条校验, 以便返回明确错误。
+    """
+    segment_id: Any = None
+    increment: Any = None
+    cost: Any = None
+
+
+class CapacityExpansionIn(BaseModel):
+    """管段扩容预览录入: 沿用容量校核三类录入 + 至多 6 个扩容候选。
+
+    capacities/supplies/demands 的规则与供水容量校核一致(编号与方案快照
+    完整对应、正整数); 每个候选为一条不同的未关阀管段、正整数扩容增量
+    与正整数一次性费用。逐条校验在 solver.plan_capacity_expansion 中进行,
+    以便返回明确错误。
+    """
+    capacities: dict[str, Any] = Field(default_factory=dict)
+    supplies: dict[str, Any] = Field(default_factory=dict)
+    demands: dict[str, Any] = Field(default_factory=dict)
+    candidates: list[ExpansionCandidateIn] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -518,6 +545,46 @@ def plan_capacity_check_preview(plan_id: int,
                                      req.capacities,
                                      req.supplies,
                                      req.demands)
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
+    result["solver"] = plan.get("solver", "base")
+    return result
+
+
+@app.post("/api/plans/{plan_id}/capacity-expansion")
+def plan_capacity_expansion_preview(plan_id: int,
+                                    req: CapacityExpansionIn) -> dict:
+    """已保存可行方案的管段扩容预览(独立 API, 只读计算)。
+
+    沿用供水容量校核的录入(方案快照中未关阀管段流量上限、进水点供给
+    上限、必保点需求, 编号完整对应、正整数), 另录至多 6 个扩容候选:
+    每个候选为一条不同的未关阀管段、正整数扩容增量与正整数一次性费用,
+    每项最多选一次; 扩容后管段净流量绝对值受 原上限+增量 约束。枚举
+    候选组合并以整数最大流检验全部需求, 选一次性费用合计最低者, 同费
+    按管段编号升序列表字典序决胜; 原容量已足够时返回零费用空清单;
+    全部候选仍不足时返回全选后的最大送达量与总缺口。不修改管网与历史
+    方案。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有可行的关阀后输水网, 不能进行管段扩容预览"
+        ]})
+    try:
+        result = plan_capacity_expansion(plan["network_snapshot"],
+                                         plan.get("closed_valves", []),
+                                         req.capacities,
+                                         req.supplies,
+                                         req.demands,
+                                         [c.model_dump()
+                                          for c in req.candidates])
     except NetworkValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
     result["plan_id"] = plan_id
