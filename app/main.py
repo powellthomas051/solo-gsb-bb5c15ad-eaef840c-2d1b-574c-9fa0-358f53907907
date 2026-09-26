@@ -17,6 +17,8 @@ API:
   POST /api/plans/{id}/spare-parts  可行方案的关阀作业备件包采购预览(只读计算)
   POST /api/plans/{id}/capacity-check
                                     可行方案的供水容量校核(只读计算)
+  POST /api/plans/{id}/capacity-expansion
+                                    可行方案的管段扩容预览(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -35,9 +37,9 @@ from pydantic import BaseModel, Field, field_validator
 import database
 from demo import DEMO_NETWORK
 from solver import (MAX_VALVES, NetworkValidationError, plan_capacity_check,
-                    plan_jumpers, plan_monitors, plan_sequence,
-                    plan_spare_parts, plan_water_delivery, solve,
-                    solve_failover, solve_siting, solve_tradeoff)
+                    plan_capacity_expansion, plan_jumpers, plan_monitors,
+                    plan_sequence, plan_spare_parts, plan_water_delivery,
+                    solve, solve_failover, solve_siting, solve_tradeoff)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -196,6 +198,30 @@ class CapacityCheckIn(BaseModel):
     capacities: dict[str, Any] = Field(default_factory=dict)
     supplies: dict[str, Any] = Field(default_factory=dict)
     demands: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExpansionIn(BaseModel):
+    """管段扩容候选录入。
+
+    各字段(不同的未关阀管段/正整数增量/正整数一次性费用)在
+    solver.plan_capacity_expansion 中逐条校验, 以便返回明确错误。
+    """
+    segment_id: Any = None
+    increment: Any = None
+    cost: Any = None
+
+
+class CapacityExpansionIn(BaseModel):
+    """管段扩容预览录入: 容量校核三类录入 + 至多 6 个扩容候选。
+
+    每个候选针对一条不同的未关阀管段, 含正整数增量与正整数一次性费用,
+    每条管段每项最多选一次; 逐条校验(数量上限、管段唯一且未关阀、
+    正整数等)在 solver.plan_capacity_expansion 中进行, 以便返回明确错误。
+    """
+    capacities: dict[str, Any] = Field(default_factory=dict)
+    supplies: dict[str, Any] = Field(default_factory=dict)
+    demands: dict[str, Any] = Field(default_factory=dict)
+    expansions: list[ExpansionIn] = Field(default_factory=list)
 
 
 @asynccontextmanager
@@ -518,6 +544,45 @@ def plan_capacity_check_preview(plan_id: int,
                                      req.capacities,
                                      req.supplies,
                                      req.demands)
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
+    result["solver"] = plan.get("solver", "base")
+    return result
+
+
+@app.post("/api/plans/{plan_id}/capacity-expansion")
+def plan_capacity_expansion_preview(plan_id: int,
+                                    req: CapacityExpansionIn) -> dict:
+    """已保存可行方案的管段扩容预览(独立 API, 只读计算)。
+
+    沿用供水容量校核录入(未关阀管段正整数流量上限、进水点正整数供给
+    上限、必保点正整数需求), 另录至多 6 个不同未关阀管段的扩容候选
+    (正整数增量 + 正整数一次性费用, 每条管段每项最多选一次)。枚举全部
+    候选组合并用整数最大流检验全部需求, 选一次性费用合计最低者, 同费按
+    扩容管段编号升序列表字典序决胜; 原容量已足够时返回零费用空清单;
+    全部候选仍不足时返回全选后的最大送达量与总缺口。不修改管网与历史
+    方案。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有可行的关阀后输水网, 不能进行管段扩容预览"
+        ]})
+    try:
+        result = plan_capacity_expansion(plan["network_snapshot"],
+                                         plan.get("closed_valves", []),
+                                         req.capacities,
+                                         req.supplies,
+                                         req.demands,
+                                         [c.model_dump()
+                                          for c in req.expansions])
     except NetworkValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
     result["plan_id"] = plan_id

@@ -1625,7 +1625,28 @@ function appendCapacityPanel(r) {
       <span class="role-name">未关阀管段 ${openSegs.length} 条 / 进水点 ${inlets.length} 个 / 必保点 ${keeps.length} 个, 编号须与方案快照完整对应; 校核只读</span>
     </p>
     <div id="capacity-errors" class="errors hidden"></div>
-    <div id="capacity-result"></div>`;
+    <div id="capacity-result"></div>
+
+    <h4>管段扩容预览 <span class="role-name">(只读预览, 不修改管网与历史方案)</span></h4>
+    <p class="role-name">
+      若容量不足, 可为<b>不同的未关阀管段</b>添加至多 <b>6 个</b>扩容候选,
+      每项填<b>正整数增量</b>(扩容后管段净流量绝对值受「原上限 + 增量」约束)
+      与<b>正整数一次性费用</b>, 每条管段每项最多选一次。系统枚举全部候选组合,
+      用整数最大流检验能否满足全部必保点需求, 选<b>总费用最低</b>者,
+      同费按扩容管段编号升序列表字典序决胜; 原容量已足够时返回零费用空清单,
+      全部候选仍不足时给出全选后的最大送达量与总缺口。
+    </p>
+    <table id="table-expansions"><thead><tr>
+      <th>扩容管段</th><th>端点</th><th>原上限</th><th>扩容增量（正整数）</th>
+      <th>一次性费用（正整数）</th><th>扩容后上限</th><th></th>
+    </tr></thead><tbody></tbody></table>
+    <button id="btn-add-expansion" class="add-row" type="button">＋ 添加扩容候选</button>
+    <p>
+      <button id="btn-expansion" type="button" class="primary">管段扩容预览求解</button>
+      <span class="role-name" id="expansion-hint"></span>
+    </p>
+    <div id="expansion-errors" class="errors hidden"></div>
+    <div id="expansion-result"></div>`;
   body.appendChild(card);
 
   card.querySelector("#btn-capacity").addEventListener("click", async () => {
@@ -1653,6 +1674,197 @@ function appendCapacityPanel(r) {
       errBox.classList.remove("hidden");
     }
   });
+
+  // ---- 管段扩容候选(本地行状态): {segment_id, increment, cost} ----
+  const segById = new Map(openSegs.map((s) => [s.id, s]));
+  const expansions = [];
+  const exTbody = card.querySelector("#table-expansions tbody");
+
+  function renderExpansionRows() {
+    exTbody.innerHTML = expansions.map((ex, i) => {
+      const seg = segById.get(ex.segment_id);
+      const capInp = ex.segment_id && seg
+        ? card.querySelector(`input[data-cap="${CSS.escape(ex.segment_id)}"]`)
+        : null;
+      const baseCap = capInp && capInp.value.trim() !== ""
+        && Number.isFinite(Number(capInp.value)) ? Number(capInp.value) : null;
+      const newCap = baseCap != null && Number.isFinite(Number(ex.increment))
+        ? baseCap + Number(ex.increment) : null;
+      return `
+      <tr data-i="${i}">
+        <td>
+          <select data-f="segment_id">
+            <option value="">— 选择管段 —</option>
+            ${openSegs.map((s) => `<option value="${esc(s.id)}"${
+              ex.segment_id === s.id ? " selected" : ""}>${esc(s.id)}</option>`).join("")}
+          </select>
+        </td>
+        <td class="role-name" data-endpoints>${
+          seg ? `${esc(seg.endpoint_a)} — ${esc(seg.endpoint_b)}` : "—"}
+        </td>
+        <td class="role-name" data-basecap>${baseCap == null ? "—" : baseCap}
+        </td>
+        <td><input data-f="increment" type="number" min="1" step="1"
+          value="${esc(ex.increment)}" style="width:7em"></td>
+        <td><input data-f="cost" type="number" min="1" step="1"
+          value="${esc(ex.cost)}" style="width:7em"></td>
+        <td class="role-name" data-newcap>${newCap == null ? "—" : newCap}
+        </td>
+        <td class="act"><button data-del="${i}" title="删除">✕</button></td>
+      </tr>`;
+    }).join("");
+    card.querySelector("#expansion-hint").textContent =
+      `扩容候选 ${expansions.length} 个（至多 6 个, 同一管段至多一个）；预览只读`;
+  }
+
+  card.querySelector("#btn-add-expansion").addEventListener("click", () => {
+    if (expansions.length >= 6) {
+      const errBox = card.querySelector("#expansion-errors");
+      errBox.innerHTML = "<b>扩容候选最多 6 个</b>";
+      errBox.classList.remove("hidden");
+      return;
+    }
+    expansions.push({ segment_id: "", increment: 1, cost: 1 });
+    renderExpansionRows();
+  });
+  exTbody.addEventListener("input", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const i = Number(tr.dataset.i);
+    const f = e.target.dataset.f;
+    if (f === "increment" || f === "cost") {
+      expansions[i][f] = Number(e.target.value);
+      // 仅刷新本行「扩容后上限」, 不重建行以保留输入焦点
+      const cap = card.querySelector(
+        `input[data-cap="${CSS.escape(expansions[i].segment_id)}"]`);
+      const cell = tr.querySelector("[data-newcap]");
+      const inc = Number(e.target.value);
+      if (cell && cap && Number.isFinite(Number(cap.value))
+          && Number.isFinite(inc)) {
+        cell.textContent = Number(cap.value) + inc;
+      } else if (cell) {
+        cell.textContent = "—";
+      }
+    }
+  });
+  exTbody.addEventListener("change", (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr) return;
+    const i = Number(tr.dataset.i);
+    if (e.target.dataset.f === "segment_id") {
+      expansions[i].segment_id = e.target.value;
+      renderExpansionRows();
+    }
+  });
+  exTbody.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-del]");
+    if (!btn) return;
+    expansions.splice(Number(btn.dataset.del), 1);
+    renderExpansionRows();
+  });
+  // 管段原上限输入变化时, 刷新候选行显示的原上限/扩容后上限
+  card.querySelector("#table-capacity-segs").addEventListener("input", () => {
+    if (expansions.length) renderExpansionRows();
+  });
+  card.querySelector("#btn-expansion").addEventListener("click", async () => {
+    const errBox = card.querySelector("#expansion-errors");
+    const resBox = card.querySelector("#expansion-result");
+    errBox.classList.add("hidden");
+    resBox.innerHTML = "";
+    const collect = (attr) => {
+      const out = {};
+      card.querySelectorAll(`input[data-${attr}]`).forEach((inp) => {
+        out[inp.dataset[attr]] = inp.value.trim() === "" ? null : Number(inp.value);
+      });
+      return out;
+    };
+    const payloadExpansions = expansions
+      .filter((ex) => ex.segment_id)
+      .map((ex) => ({
+        segment_id: ex.segment_id, increment: ex.increment, cost: ex.cost,
+      }));
+    try {
+      const res = await api("POST",
+        `/api/plans/${r.id}/capacity-expansion`, {
+          capacities: collect("cap"),
+          supplies: collect("sup"),
+          demands: collect("dem"),
+          expansions: payloadExpansions,
+        });
+      renderExpansionResult(res, resBox);
+    } catch (err) {
+      errBox.innerHTML = `<b>无法求解管段扩容预览:</b><ul>${
+        String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+      errBox.classList.remove("hidden");
+    }
+  });
+  renderExpansionRows();
+}
+
+function renderExpansionResult(res, box) {
+  const segRows = (res.selected_expansions || []).map((ex) => `
+    <tr>
+      <td><b>${esc(ex.segment_id)}</b></td>
+      <td class="role-name">${esc(ex.endpoint_a)} — ${esc(ex.endpoint_b)}</td>
+      <td>${ex.capacity}</td>
+      <td><span class="tag flowing">+${ex.increment}</span></td>
+      <td><b>${ex.expanded_capacity}</b></td>
+      <td>${ex.cost}</td>
+    </tr>`).join("");
+
+  const nodeRows = (res.node_summary || []).map((ns) => `
+    <tr>
+      <td><b>${esc(ns.node_id)}</b>${
+        ns.label && ns.label !== ns.node_id ? ` <span class="role-name">(${esc(ns.label)})</span>` : ""}
+      </td>
+      <td>${ns.demand}</td>
+      <td>${ns.delivered}</td>
+      <td>${ns.shortage > 0
+        ? `<span class="tag leak_not_isolated">${ns.shortage}</span>`
+        : '<span class="tag supplied">0</span>'}</td>
+    </tr>`).join("");
+
+  let banner;
+  if (res.satisfied && res.selected_segment_ids.length === 0) {
+    banner = `<div class="banner ok">
+      <span class="big">✓ 原容量已足够 · 零费用空清单</span>${esc(res.message)}
+      <br><small>共枚举 ${res.combination_count} 个候选组合。
+      本结果为只读预览, 未修改管网与历史方案。</small>
+    </div>`;
+  } else if (res.satisfied) {
+    banner = `<div class="banner ok">
+      <span class="big">✓ 扩容后全部需求满足</span>${esc(res.message)}
+      <br><small>共枚举 ${res.combination_count} 个候选组合, 其中
+      ${res.feasible_combination_count} 个可满足全部需求。
+      本结果为只读预览, 未修改管网与历史方案。</small>
+    </div>
+    <h4>选中扩容管段（${res.selected_segment_ids.length} 条, 一次性费用合计 ${res.total_cost}）</h4>
+    <table><thead><tr>
+      <th>扩容管段</th><th>端点</th><th>原上限</th><th>增量</th>
+      <th>扩容后上限</th><th>一次性费用</th>
+    </tr></thead><tbody>${segRows}</tbody></table>`;
+  } else {
+    banner = `<div class="banner bad">
+      <span class="big">✗ 全部候选仍不足</span>${esc(res.message)}
+      <br><small>全部 ${res.candidate_count} 个候选(费用合计参考
+      ${res.all_candidates_cost_total})全选后仍无法满足, 不产生扩容方案。
+      本结果为只读预览, 未修改管网与历史方案。</small>
+    </div>`;
+  }
+
+  box.innerHTML = `
+    ${banner}
+    <div class="summary">
+      <span>需求总量: <b>${res.total_demand}</b></span>
+      <span>原容量最大送达量: <b>${res.baseline_delivered_total}</b></span>
+      <span>${res.satisfied ? "扩容后最大送达量" : "全选后最大送达量"}: <b>${res.delivered_total}</b></span>
+      <span>总缺口: <b>${res.shortage_total}</b></span>
+      <span>扩容总费用: <b>${res.total_cost == null ? "不产生" : res.total_cost}</b></span>
+    </div>
+    <h4>扩容后各必保点供水结论（按必保点编号升序逐个最大化, 结果唯一）</h4>
+    <table><thead><tr>
+      <th>必保点</th><th>需求</th><th>实际送达量</th><th>缺口</th>
+    </tr></thead><tbody>${nodeRows}</tbody></table>`;
 }
 
 function renderCapacityResult(res, box) {
